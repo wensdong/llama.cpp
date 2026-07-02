@@ -9,6 +9,7 @@
 #include "ngram-map.h"
 #include "ngram-mod.h"
 #include "sampling.h"
+#include "speculative-sched.h"
 
 #include <algorithm>
 #include <cassert>
@@ -163,6 +164,9 @@ struct common_speculative_impl {
 
     // true if this implementation requires the target context to extract pre-norm embeddings
     virtual bool need_embd_nextn() const { return false; }
+
+    // log implementation-specific statistics
+    virtual void print_extra_stats() const {}
 };
 
 struct common_speculative_impl_draft_simple : public common_speculative_impl {
@@ -436,6 +440,15 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     // pre-advancement before process() mirrored the verify batch.
     std::vector<uint16_t> last_n_drafted;
 
+    // confidence-scheduled draft length (DSpark-style, see speculative-sched.h)
+    bool sched_enabled = false;
+    common_spec_sched sched;
+
+    std::vector<std::vector<float>> last_p_raw;    // [n_seq] raw top-1 probs of the last submitted draft
+    std::vector<int32_t>            last_verify_n; // [n_seq] token count of the last verification batch
+    int64_t t_draft_end_us = -1;                   // end timestamp of the previous draft() call
+    bool    cycle_valid    = false;                // draft-to-draft cycle time is measurable
+
     common_speculative_impl_draft_mtp(const common_params_speculative & params, uint32_t n_seq)
         : common_speculative_impl(COMMON_SPECULATIVE_TYPE_DRAFT_MTP, n_seq)
         , params(params.draft)
@@ -499,6 +512,13 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         verify_h_rows.assign(n_seq, 0);
 
         last_n_drafted.assign(n_seq, 0);
+
+        sched_enabled = this->params.sched;
+        if (sched_enabled) {
+            LOG_INF("%s: - confidence-scheduled draft length enabled (static p_min used only during warmup)\n", __func__);
+        }
+        last_p_raw.assign(n_seq, {});
+        last_verify_n.assign(n_seq, 0);
     }
 
     ~common_speculative_impl_draft_mtp() override {
@@ -522,6 +542,10 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     }
 
     void begin(llama_seq_id seq_id, const llama_tokens & prompt) override {
+        // a new generation starts: the time since the previous draft() call is
+        // not a decode cycle, do not feed it to the cost model
+        cycle_valid = false;
+
         const int32_t N = (int32_t) prompt.size();
         if (N <= 0) {
             return;
@@ -622,6 +646,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
             const int32_t n_rows = i_batch_end[seq_id] - i_batch_beg[seq_id] + 1;
             verify_h_rows[seq_id] = n_rows;
+            last_verify_n[seq_id] = n_rows;
             verify_h[seq_id].resize((size_t) n_rows * n_embd);
 
             for (int32_t i = 0; i < n_rows; ++i) {
@@ -648,6 +673,30 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         const float * h_row = nullptr;
         const size_t row_bytes = (size_t) n_embd * sizeof(float);
 
+        const int64_t t_draft_beg = ggml_time_us();
+
+        if (sched_enabled && cycle_valid && t_draft_end_us > 0) {
+            // the time since the previous draft() call is one full verification
+            // cycle; attribute it to the verify batch size when it is unambiguous:
+            // a single sequence was verified and the batch matches the draft we
+            // submitted (1 sampled token + draft), i.e. it was not a prefill
+            // chunk or a truncated draft
+            int32_t n_verify = 0;
+            int     n_used   = 0;
+            for (llama_seq_id s = 0; s < (llama_seq_id) n_seq; ++s) {
+                if (last_verify_n[s] > 0) {
+                    if (last_verify_n[s] == 1 + (int32_t) last_n_drafted[s]) {
+                        n_verify = last_verify_n[s];
+                    }
+                    n_used++;
+                }
+            }
+            if (n_used == 1 && n_verify > 0) {
+                sched.update_t_rest(n_verify, t_draft_beg - t_draft_end_us);
+            }
+        }
+        std::fill(last_verify_n.begin(), last_verify_n.end(), 0);
+
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
             auto & dp = dparams[seq_id];
 
@@ -663,13 +712,30 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
             h_row = pending_h[seq_id].data();
             std::memcpy(batch.embd + n_embd*(batch.n_tokens - 1), h_row, row_bytes);
+
+            if (sched_enabled) {
+                last_p_raw[seq_id].clear();
+            }
         }
+
+        const int n_seq_drafted = n_drafting;
+
+        int64_t t_dec = ggml_time_us();
 
         int ret = llama_decode(ctx_dft, batch);
         if (ret != 0) {
             LOG_WRN("%s: llama_decode returned %d\n", __func__, ret);
             return;
         }
+
+        if (sched_enabled) {
+            sched.update_t_draft_step(ggml_time_us() - t_dec);
+        }
+
+        // per-seq cumulative survival probability of the draft prefix and its sum,
+        // used by the confidence scheduler
+        std::vector<double> a_cum(n_seq, 1.0);
+        std::vector<double> sum_a(n_seq, 0.0);
 
         int i = 0;
 
@@ -698,10 +764,44 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 }
 
                 // add drafted token for each sequence
-                const llama_token id = cur_p->data[0].id;
+                const llama_token id     = cur_p->data[0].id;
+                const float       p_top1 = cur_p->data[0].p;
 
-                // only collect very high-confidence draft tokens
-                if (cur_p->data[0].p < params.p_min) {
+                auto & dp = dparams.at(seq_id);
+                auto & result = *dp.result;
+
+                bool keep = false;
+                bool stop = false;
+
+                if (sched_enabled && sched.ready()) {
+                    // confidence-scheduled: keep drafting while the expected
+                    // generation rate keeps improving
+                    const int32_t k = (int32_t) result.size() + 1;
+
+                    int32_t n_max_eff = params.n_max;
+                    if (dp.n_max > 0) {
+                        n_max_eff = std::min(n_max_eff, dp.n_max);
+                    }
+
+                    const float c_k = sched.calibrate(k, p_top1);
+
+                    switch (sched.decide(k, c_k, a_cum[seq_id], sum_a[seq_id], n_max_eff)) {
+                        case common_spec_sched::SPEC_SCHED_DROP_STOP: keep = false; stop = true;  break;
+                        case common_spec_sched::SPEC_SCHED_KEEP_STOP: keep = true;  stop = true;  break;
+                        case common_spec_sched::SPEC_SCHED_CONTINUE:  keep = true;  stop = false; break;
+                    }
+
+                    if (keep) {
+                        a_cum[seq_id] *= c_k;
+                        sum_a[seq_id] += a_cum[seq_id];
+                    }
+                } else {
+                    // static threshold: only collect very high-confidence draft tokens
+                    keep = p_top1 >= params.p_min;
+                    stop = !keep || params.n_max <= (int) result.size() + 1;
+                }
+
+                if (!keep) {
                     drafting[seq_id] = false;
                     n_drafting--;
 
@@ -710,12 +810,13 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
                 common_sampler_accept(smpl, id, true);
 
-                auto & dp = dparams.at(seq_id);
-                auto & result = *dp.result;
-
                 result.push_back(id);
 
-                if (params.n_max <= (int) result.size()) {
+                if (sched_enabled) {
+                    last_p_raw[seq_id].push_back(p_top1);
+                }
+
+                if (stop) {
                     drafting[seq_id] = false;
                     n_drafting--;
                     continue;
@@ -730,10 +831,16 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             }
 
             // evaluate the drafted tokens on the draft model
+            t_dec = ggml_time_us();
+
             ret = llama_decode(ctx_dft, batch);
             if (ret != 0) {
                 LOG_WRN("%s: llama_decode[%d] returned %d\n", __func__, i, ret);
                 break;
+            }
+
+            if (sched_enabled) {
+                sched.update_t_draft_step(ggml_time_us() - t_dec);
             }
 
             ++i;
@@ -750,10 +857,22 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             }
 
             last_n_drafted[seq_id] = (uint16_t) dp.result->size();
+
+            if (sched_enabled) {
+                if (last_p_raw[seq_id].size() > dp.result->size()) {
+                    last_p_raw[seq_id].resize(dp.result->size());
+                }
+                sched.note_len((int32_t) dp.result->size());
+            }
+        }
+
+        if (sched_enabled && n_seq_drafted > 0) {
+            t_draft_end_us = ggml_time_us();
+            cycle_valid    = true;
         }
     }
 
-    void accept(llama_seq_id seq_id, uint16_t n_accepted, bool /*is_other*/) override {
+    void accept(llama_seq_id seq_id, uint16_t n_accepted, bool is_other) override {
         if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq) {
             return;
         }
@@ -761,6 +880,19 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         const int32_t n_rows = verify_h_rows[seq_id];
         if (n_rows <= 0) {
             return;
+        }
+
+        if (sched_enabled && !is_other) {
+            auto & p_raw = last_p_raw[seq_id];
+
+            // the verify batch held 1 sampled token + the submitted draft; the
+            // dispatch layer may have truncated the draft after we generated it
+            const int32_t l = std::min<int32_t>((int32_t) p_raw.size(), n_rows - 1);
+            if (l > 0) {
+                p_raw.resize(l);
+                sched.update_accept(p_raw, std::min<int32_t>(n_accepted, l));
+            }
+            p_raw.clear();
         }
 
         const int32_t i_h = std::min<int32_t>(n_accepted, n_rows - 1);
@@ -774,6 +906,12 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
     bool need_embd_nextn() const override {
         return true;
+    }
+
+    void print_extra_stats() const override {
+        if (sched_enabled) {
+            sched.print_stats();
+        }
     }
 };
 
@@ -1683,5 +1821,7 @@ void common_speculative_print_stats(const common_speculative * spec) {
                 impl->n_gen_tokens,
                 impl->n_acc_tokens,
                 str_perf.c_str());
+
+        impl->print_extra_stats();
     }
 }

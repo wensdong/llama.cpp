@@ -104,6 +104,8 @@ add_library(${TARGET}
     sampling.h
     speculative.cpp
     speculative.h
+    speculative-sched.cpp
+    speculative-sched.h
     unicode.cpp
     unicode.h
     jinja/lexer.cpp
