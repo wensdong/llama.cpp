@@ -720,17 +720,19 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
         const int n_seq_drafted = n_drafting;
 
-        int64_t t_dec = ggml_time_us();
+        // amortized full per-step draft cost (decode + sampling + bookkeeping);
+        // timing only the decode severely underestimates the step on large
+        // vocabularies, where the CPU softmax per sampled token is comparable
+        // to the draft decode itself
+        int     n_steps      = 0;
+        int64_t t_steps_beg  = ggml_time_us();
 
         int ret = llama_decode(ctx_dft, batch);
         if (ret != 0) {
             LOG_WRN("%s: llama_decode returned %d\n", __func__, ret);
             return;
         }
-
-        if (sched_enabled) {
-            sched.update_t_draft_step(ggml_time_us() - t_dec);
-        }
+        n_steps++;
 
         // per-seq cumulative survival probability of the draft prefix and its sum,
         // used by the confidence scheduler
@@ -796,8 +798,12 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                         sum_a[seq_id] += a_cum[seq_id];
                     }
                 } else {
-                    // static threshold: only collect very high-confidence draft tokens
-                    keep = p_top1 >= params.p_min;
+                    // static threshold: only collect very high-confidence draft tokens.
+                    // during scheduler warmup an unset p_min must not mean "keep
+                    // everything up to n_max" - use a conservative default
+                    const float p_min_eff = (sched_enabled && params.p_min <= 0.0f) ? 0.75f : params.p_min;
+
+                    keep = p_top1 >= p_min_eff;
                     stop = !keep || params.n_max <= (int) result.size() + 1;
                 }
 
@@ -831,19 +837,18 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             }
 
             // evaluate the drafted tokens on the draft model
-            t_dec = ggml_time_us();
-
             ret = llama_decode(ctx_dft, batch);
             if (ret != 0) {
                 LOG_WRN("%s: llama_decode[%d] returned %d\n", __func__, i, ret);
                 break;
             }
-
-            if (sched_enabled) {
-                sched.update_t_draft_step(ggml_time_us() - t_dec);
-            }
+            n_steps++;
 
             ++i;
+        }
+
+        if (sched_enabled && n_steps > 0) {
+            sched.update_t_draft_step((ggml_time_us() - t_steps_beg) / n_steps);
         }
 
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
