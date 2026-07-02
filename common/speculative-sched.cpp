@@ -48,16 +48,17 @@ float common_spec_sched::expected_c(int32_t j) const {
 
     const auto & s = pos[j - 1];
     if (s.n < params.n_warmup) {
-        // no data yet - fall back to the deepest calibrated position (mildly
-        // optimistic, encourages exploring deeper drafts which then produces
-        // the data that corrects this estimate)
+        // no data at this depth yet - extrapolate from the deepest calibrated
+        // position, shrunk per missing level; unmetered optimism here makes the
+        // scheduler overdraft into depths whose real cost it has never seen
         for (int32_t i = j - 1; i >= 1; --i) {
             const auto & q = pos[i - 1];
             if (q.n >= params.n_warmup) {
-                return (float) std::clamp(q.a_sum / q.n, 0.0, 1.0);
+                const double base = std::clamp(q.a_sum / q.n, 0.0, 1.0);
+                return (float) std::max(0.05, base * std::pow(0.85, j - i));
             }
         }
-        return 0.75f;
+        return 0.5f;
     }
 
     return (float) std::clamp(s.a_sum / s.n, 0.0, 1.0);
@@ -115,11 +116,18 @@ double common_spec_sched::t_rest(int32_t n_verify) const {
         return (1.0 - w) * rest[lo].t_us + w * rest[hi].t_us;
     }
     if (lo >= 0) {
-        // no data above: assume the verify batch grows for free (single-slot
-        // decode is launch-latency bound); optimistic on purpose - it makes the
-        // scheduler explore deeper drafts, and the resulting measurements
-        // correct the curve
-        return rest[lo].t_us;
+        // no data above: extend the slope of the two highest measured buckets
+        // (never negative); a flat assumption here proved too optimistic and
+        // made the scheduler dive into depths whose true cost it had not seen
+        int32_t lo2 = -1;
+        for (int32_t i = lo - 1; i >= 1; --i) {
+            if (rest[i].n > 0) { lo2 = i; break; }
+        }
+        double slope = 0.0;
+        if (lo2 >= 0) {
+            slope = std::max(0.0, (rest[lo].t_us - rest[lo2].t_us) / (double) (lo - lo2));
+        }
+        return rest[lo].t_us + slope * (n_verify - lo);
     }
     if (hi >= 0) {
         return rest[hi].t_us;
@@ -129,7 +137,12 @@ double common_spec_sched::t_rest(int32_t n_verify) const {
 }
 
 double common_spec_sched::theta(int32_t l, double sum_a) const {
-    const double t = (double) l * t_draft_step_us + t_rest(1 + l);
+    // sampling draft token j requires draft decode j, so a submitted chain of
+    // length l cost l+1 decodes when it ended on a dropped probe and l when it
+    // stopped by lookahead; charge l+1 (the drop-terminated case dominates
+    // near the optimum), which also charges the mandatory initial decode to
+    // the l = 0 case
+    const double t = (double) (l + 1) * t_draft_step_us + t_rest(1 + l);
     if (t <= 0.0) {
         return 0.0;
     }
@@ -139,12 +152,14 @@ double common_spec_sched::theta(int32_t l, double sum_a) const {
 common_spec_sched::decision common_spec_sched::decide(int32_t k, float c_k, double a_prev, double sum_prev, int32_t n_max) const {
     const double a_k = a_prev * c_k;
 
-    // greedy early stop (DSpark Algorithm 1): once adding token k no longer
-    // improves the expected rate, drop it and stop
-    const double th_prev = theta(k - 1, sum_prev);
-    const double th_keep = theta(k, sum_prev + a_k);
+    // at this point k draft decodes have been spent whether token k is kept or
+    // dropped - the drop/keep choice only changes the verify batch size, so
+    // compare at equal (sunk) draft cost
+    const double t_sunk   = (double) k * t_draft_step_us;
+    const double th_drop  = (1.0 + sum_prev)       / (t_sunk + t_rest(k));
+    const double th_keep  = (1.0 + sum_prev + a_k) / (t_sunk + t_rest(k + 1));
 
-    if (th_keep <= th_prev) {
+    if (th_keep <= th_drop) {
         return SPEC_SCHED_DROP_STOP;
     }
 
@@ -152,11 +167,12 @@ common_spec_sched::decision common_spec_sched::decide(int32_t k, float c_k, doub
         return SPEC_SCHED_KEEP_STOP;
     }
 
-    // continuation lookahead: drafting one more token costs another draft
+    // continuation lookahead: drafting one more token costs one more draft
     // decode; predict its acceptance from the per-position aggregate since the
     // token itself has not been sampled yet (keeps the decision causal)
     const double a_next  = a_k * expected_c(k + 1);
-    const double th_next = theta(k + 1, sum_prev + a_k + a_next);
+    const double th_next = (1.0 + sum_prev + a_k + a_next) /
+                           (t_sunk + t_draft_step_us + t_rest(k + 2));
 
     if (th_next <= th_keep) {
         return SPEC_SCHED_KEEP_STOP;

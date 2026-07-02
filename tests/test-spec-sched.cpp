@@ -74,8 +74,9 @@ static void test_cost_interpolation() {
     const double t4 = sched.t_rest(4);
     assert(t4 > 10000.0 && t4 < 12000.0);
 
-    // above the highest measured bucket: optimistic flat extrapolation
-    assert(std::fabs(sched.t_rest(10) - 12000.0) < 200.0);
+    // above the highest measured bucket: extend the slope of the two highest
+    // measured buckets (10000@2 .. 12000@6 -> 500/step -> 14000@10)
+    assert(std::fabs(sched.t_rest(10) - 14000.0) < 400.0);
 
     // outlier rejection: a request-boundary stall must not blow up the estimate
     sched.update_t_rest(2, 5000000);
@@ -84,7 +85,7 @@ static void test_cost_interpolation() {
     printf("%s: OK\n", __func__);
 }
 
-static common_spec_sched make_ready_sched(double acc_flat, double t_draft, double t_rest) {
+static common_spec_sched make_ready_sched(double acc_flat, double t_draft, double t_rest, double t_rest_slope = 0.0) {
     common_spec_sched sched;
 
     std::mt19937 rng(7);
@@ -106,7 +107,7 @@ static common_spec_sched make_ready_sched(double acc_flat, double t_draft, doubl
     for (int i = 0; i < 32; ++i) {
         sched.update_t_draft_step((int64_t) t_draft);
         for (int n = 1; n <= 9; ++n) {
-            sched.update_t_rest(n, (int64_t) t_rest);
+            sched.update_t_rest(n, (int64_t) (t_rest + t_rest_slope * n));
         }
     }
 
@@ -155,9 +156,11 @@ static void test_decision() {
         assert(len <= 2);
     }
 
-    // a token with negligible confidence is dropped regardless of history
+    // a token with negligible confidence is dropped when the verify batch has
+    // a real marginal cost (with a perfectly flat verify curve keeping a free
+    // token is rationally harmless, so use a sloped curve here)
     {
-        common_spec_sched sched = make_ready_sched(0.9, 100, 10000);
+        common_spec_sched sched = make_ready_sched(0.9, 100, 8000, /*slope*/ 2000);
         const auto d = sched.decide(3, 0.001f, 0.8, 1.5, 8);
         assert(d == common_spec_sched::SPEC_SCHED_DROP_STOP);
     }
