@@ -1,5 +1,7 @@
 #include "../common/speculative-sched.h"
 
+// the checks below must run in Release builds too
+#undef NDEBUG
 #include <cassert>
 #include <cmath>
 #include <cstdio>
@@ -9,8 +11,13 @@
 
 static void test_calibration_convergence() {
     // the drafter reports p=0.9 at every position but the true acceptance rates
-    // decay with depth; the calibrator must converge to the empirical rates
-    common_spec_sched sched;
+    // decay with depth; the calibrator must converge to the empirical rates.
+    // a long EMA window keeps the sampling noise well below the 0.03 tolerance
+    // (the production default 0.995 tracks ~200 trials and wobbles ~+-0.03 by design)
+    common_spec_sched_params sp;
+    sp.ema_stats = 0.9999f;
+
+    common_spec_sched sched(sp);
 
     const float p_raw_val = 0.9f;
     const double acc[4]   = { 0.80, 0.70, 0.55, 0.40 };

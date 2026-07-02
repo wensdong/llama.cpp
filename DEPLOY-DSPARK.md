@@ -46,6 +46,12 @@ will pick the profitable depth per step on its own. Keep whatever
 If the fetch route is inconvenient, the same change is in `patches/`
 (`git am patches/*.patch` on any tree near 588f0dc).
 
+Note: the branch bundles the prebuilt web-UI assets (`tools/ui/dist/`,
+HF bucket version b9541, checksum-verified). This sidesteps a failure mode of
+shallow clones: the UI provisioning derives the asset version from
+`git rev-list --count`, which is wrong in a shallow tree (b51), so the
+download fails and the build dies on an empty generated `ui.cpp`.
+
 ## Verify
 
 - Logs: on shutdown (or SIGINT) `common_speculative_print_stats` now prints a
